@@ -393,7 +393,7 @@ max_depth = 3
 if test is None:
     test = Network(784, 10, 2.2)
 opt_weights = tf.keras.optimizers.SGD(learning_rate=0.01)
-opt_topo = tf.keras.optimizers.Adam(learning_rate=0.001)
+opt_topo = tf.keras.optimizers.Adam(learning_rate=0.01)
 
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 train_log_dir = 'logs/gradient_tape/' + current_time + '/train'
@@ -419,14 +419,14 @@ y_test = y_test_split[1]
 x_topology = x_test_split[0, :, :]
 x_test = x_test_split[1, :, :]
 
-batches_train = 0
-batch_size_train = 400
+batches_train = 10
+batch_size_train = 200
 
-batches_topology = 4
-batch_size_topology = 1000
+batches_topology = 5
+batch_size_topology = 200
 
-batches_test = 0
-batch_size_test = 400
+batches_test = 10
+batch_size_test = 200
 
 train_dataset = []
 for i in range(batches_train):
@@ -467,7 +467,7 @@ while True:
             loss_train = tf.reduce_mean(loss_object(batch_y, result_train))
 
             if b_topology:
-                vars = test.get_topologie_variables() + test.get_weight_variables()
+                vars = test.get_topologie_variables()
                 grads = tape.gradient(loss_train, vars)
                 try:
                     opt_topo.apply_gradients(zip(grads, vars))
