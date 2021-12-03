@@ -4,9 +4,9 @@ import tensorflow as tf
 
 
 class SparseRowMatrix:
-    def __init__(self, dense_shape):
+    def __init__(self, dense_shape, dtype=tf.float32):
         self.dense_shape = dense_shape
-        self.value = tf.constant(0.0, dtype=tf.float32, shape=(0, self.dense_shape[1]))
+        self.value = tf.constant(0.0, dtype=dtype, shape=[0] + self.dense_shape[1:])
         self.indices = [False] * self.dense_shape[0]
 
     def assign(self, value, index):
@@ -14,12 +14,16 @@ class SparseRowMatrix:
         previous_not_null_rows = tf.reduce_sum(tf.cast(self.indices[:index], dtype=tf.int32))
         self.indices[index] = True
         if not row_already_filled:
-            self.value = tf.concat([self.value[:previous_not_null_rows], value, self.value[previous_not_null_rows:]],
-                                   axis=0)
+            new_value = tf.concat([self.value[:previous_not_null_rows], value, self.value[previous_not_null_rows:]],
+                                  axis=0)
         else:
-            self.value = tf.concat(
+            new_value = tf.concat(
                 [self.value[:previous_not_null_rows], value, self.value[previous_not_null_rows + 1:]],
                 axis=0)
+        if isinstance(self.value, tf.Variable):
+            self.value.assign(new_value)
+        else:
+            self.value = new_value
 
     def mul_dense(self, b_dense):
         b_dense = tf.boolean_mask(b_dense, self.indices)
