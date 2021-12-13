@@ -438,14 +438,14 @@ class Network:
 checkpoint_path = "./checkpoints/check.json"
 
 test = Network.load(checkpoint_path)
-dim_input = 784
-dim_output = 10
+dim_input = 2
+dim_output = 1
 if test is None:
     test = Network(dim_input, dim_output, [
-        Layer(dim_input, 200, 200),
-        Layer(dim_input, 200, 200),
-        Layer(dim_input, 200, 200),
-        Layer(dim_input, 0, 200),
+        Layer(dim_input, 40, 40),
+        Layer(dim_input, 40, 40),
+        Layer(dim_input, 40, 40),
+        Layer(dim_input, 0, 40),
     ])
 opt_topo = tf.keras.optimizers.Adam(learning_rate=0.01)
 
@@ -474,23 +474,6 @@ for i in range(len(layers)):
 
 """ Load the DataSet """
 
-test_input = tf.constant([
-    [0.0, 0.0],
-    [1.0, 0.0],
-    [0.0, 1.0],
-    [1.0, 1.0],
-])
-test_output = tf.constant([
-    [0.0],
-    [1.0],
-    [1.0],
-    [0.0],
-])
-
-topology_dataset = [
-    ((test_input, []), test_output)
-]
-
 mnist = tf.keras.datasets.fashion_mnist
 
 (x_train, y_train), (x_test, y_test) = mnist.load_data()
@@ -508,10 +491,10 @@ x_train = x_train_split[1, :, :]
 batches_train = 0
 batch_size_train = 100
 
-batches_topology = 40
+batches_topology = 1
 batch_size_topology = 200
 
-batches_test = 5
+batches_test = 0
 batch_size_test = 200
 
 train_dataset = []
@@ -540,7 +523,22 @@ for i in range(batches_test):
 
 """ Load the DataSet End """
 
-adam_weight_dict = {}
+test_input = tf.constant([
+    [0.0, 0.0],
+    [1.0, 0.0],
+    [0.0, 1.0],
+    [1.0, 1.0],
+])
+test_output = tf.constant([
+    [0.0],
+    [1.0],
+    [1.0],
+    [0.0],
+])
+
+topology_dataset = [
+    ((test_input, []), test_output)
+]
 
 
 def apply_batch(batch, loss_function: Callable, bweights: bool, btopology: bool):
@@ -612,9 +610,12 @@ def apply_batch(batch, loss_function: Callable, bweights: bool, btopology: bool)
         return sequence, loss
 
 
+#def loss_function(y_true, y_pred):
+#    probs = tf.math.softmax(y_pred, axis=-1)
+#    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
+
 def loss_function(y_true, y_pred):
-    probs = tf.math.softmax(y_pred, axis=-1)
-    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
+    return tf.keras.losses.mean_squared_error(y_true, y_pred)
 
 
 epoch = 0
