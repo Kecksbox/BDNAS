@@ -17,7 +17,8 @@ import tensorflow_addons as tfa
 
 from sparse_row_matrix import SparseRowMatrix
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+random.seed(0)
+tf.random.set_seed(0)
 
 tf.get_logger().setLevel('ERROR')
 
@@ -43,7 +44,16 @@ top_vis_intervall = 500
 topology_batch_size = 1
 
 # this means the loaded weights will be reset at the start and only most prob choice will be picked.
-best_choice_only_mode = True
+best_choice_only_mode = False
+
+version_name = "sparse_a_estimator_test_sequential"
+
+work_dir = "."
+# work_dir = os.environ["WORK"]
+
+
+# For debug purpose
+use_xor_set = True
 
 
 @tf.custom_gradient
@@ -116,7 +126,7 @@ def binary_gate_softmax(params):
     return sample, probs
 
 
-@tf.custom_gradient
+@tf.custom_gradient()
 def check(weight_matrix: SparseRowMatrix, activation, previous_actvation_estimate):
     def grad(upstream):
         wm_grad_st = tf.matmul(upstream, tf.transpose(previous_actvation_estimate))
@@ -438,18 +448,31 @@ class Network:
             tf.print("Load Error")
             return None
 
+def categorical_loss(y_true, y_pred):
+    probs = tf.math.softmax(y_pred, axis=-1)
+    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
 
-checkpoint_path = "./checkpoints/sparse_a_estimator_check.json"
+def mean_squared_loss(y_true, y_pred):
+    return tf.keras.losses.mean_squared_error(y_true, y_pred)
+
+
+checkpoint_path = work_dir + f'/checkpoints/{version_name}_check.json'
 
 test = Network.load(checkpoint_path)
 
-dim_input = 2
-dim_output = 1
+loss_function = categorical_loss
+
+dim_input = 784
+dim_output = 10
 if test is None:
     test = Network(dim_input, dim_output, [
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 0, 40),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 0, 400),
     ])
 
 if best_choice_only_mode:
@@ -460,7 +483,7 @@ opt_topo = tf.keras.optimizers.Adam(learning_rate=learning_rate_topo, beta_1=0.5
 
 # work_dir = os.environ["WORK"]
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-train_log_dir = 'logs/gradient_tape/' + current_time + "sparse_a_estimator_test" + '/train'
+train_log_dir = work_dir + '/logs/gradient_tape/' + current_time + version_name + '/train'
 train_summary_writer = tf.summary.create_file_writer(train_log_dir)
 train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
 topology_loss = tf.keras.metrics.Mean('topology_loss', dtype=tf.float32)
@@ -470,7 +493,7 @@ active_connections = tf.keras.metrics.Mean('active_connections', dtype=tf.float3
 mean_depth = tf.keras.metrics.Mean('mean_depth', dtype=tf.float32)
 memory_used = tf.keras.metrics.Mean('memory_used', dtype=tf.float32)
 
-tp_cp_path = f'logs/topology_checkpoints/{time.strftime("%Y%m%d-%H%M%S")}/'
+tp_cp_path = work_dir + f'/logs/topology_checkpoints/{time.strftime("%Y%m%d-%H%M%S")}/'
 if os.path.exists(tp_cp_path):
     os.remove(tp_cp_path)
 if not os.path.exists(tp_cp_path):
@@ -504,13 +527,13 @@ y_train = y_train_split[1]
 x_topology = x_train_split[0, :, :]
 x_train = x_train_split[1, :, :]
 
-batches_train = 0
-batch_size_train = 100
+batches_train = 10
+batch_size_train = 200
 
-batches_topology = 1
+batches_topology = 10
 batch_size_topology = 200
 
-batches_test = 0
+batches_test = 5
 batch_size_test = 200
 
 train_dataset = []
@@ -539,22 +562,38 @@ for i in range(batches_test):
 
 """ Load the DataSet End """
 
-test_input = tf.constant([
-    [0.0, 0.0],
-    [1.0, 0.0],
-    [0.0, 1.0],
-    [1.0, 1.0],
-])
-test_output = tf.constant([
-    [0.0],
-    [1.0],
-    [1.0],
-    [0.0],
-])
 
-topology_dataset = [
-    ((test_input, []), test_output)
-]
+if use_xor_set:
+    # Now we overwrite all the normal init sets and the network (my need to remove existing checkpoints)
+    test_input = tf.constant([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 1.0],
+    ])
+    test_output = tf.constant([
+        [0.0],
+        [1.0],
+        [1.0],
+        [0.0],
+    ])
+
+    topology_dataset = [
+        ((test_input, []), test_output)
+    ]
+    test_dataset = []
+    train_dataset = []
+    dim_input = 2
+    dim_output = 1
+    if test is None or test.input_layer.dim_in != dim_input or test.output_layer.dim_out != dim_output:
+        test = Network(dim_input, dim_output, [
+            Layer(dim_input, 80, 80),
+            Layer(dim_input, 80, 80),
+            Layer(dim_input, 80, 80),
+            Layer(dim_input, 80, 80),
+            Layer(dim_input, 0, 80),
+        ])
+    loss_function = mean_squared_loss
 
 
 def clip_grads_by_global_norm(grads, norm: float):
@@ -575,7 +614,7 @@ def clip_grads_by_global_norm(grads, norm: float):
 
     return grads
 
-
+@tf.function(experimental_relax_shapes=True)
 def apply_batch(batch, loss_function: Callable, train_weight: bool, train_topology: bool):
     batch_x, batch_y = batch
 
@@ -613,14 +652,6 @@ def apply_batch(batch, loss_function: Callable, train_weight: bool, train_topolo
     return sequence, loss
 
 
-# def loss_function(y_true, y_pred):
-#    probs = tf.math.softmax(y_pred, axis=-1)
-#    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
-
-def loss_function(y_true, y_pred):
-    return tf.keras.losses.mean_squared_error(y_true, y_pred)
-
-
 if best_choice_only_mode:
     train_dataset += topology_dataset
     topology_dataset = []
@@ -628,34 +659,44 @@ if best_choice_only_mode:
 epoch = 0
 while True:
 
-    for batch in train_dataset:
-        sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=False)
+    start = time.time()
+    batches = [(e, 0) for e in train_dataset] + [(e, 1) for e in topology_dataset] + [(e, 2) for e in test_dataset]
+    random.shuffle(batches)
 
-        train_loss(loss)
+    for batch, b_id in batches:
 
-    for batch in topology_dataset:
+        if b_id == 0:
+            sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=False)
 
-        start = time.time()
-        sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=True)
-        end = time.time()
-        # tf.print("apply_batch took: {}".format(end - start))
+            train_loss(loss)
 
-        topology_loss(loss)
+        if b_id == 1:
 
-        num_active_neurons = 0
-        num_active_connections = 0
-        for weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive, output_nodes_alive in sequence:
-            num_active_neurons += activation_mask.value.shape[0]
-            num_active_connections += tf.size(weight_matrix.value)
+            if len(train_dataset) > 0:
+                sequence, loss = apply_batch(batch, loss_function, train_weight=False, train_topology=True)
+            else:
+                sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=True)
+            # tf.print("apply_batch took: {}".format(end - start))
 
-        active_neurons(num_active_neurons)
-        active_connections(num_active_connections)
-        mean_depth(len(sequence))
+            topology_loss(loss)
 
-    for batch in test_dataset:
-        sequence, loss = apply_batch(batch, loss_function, train_weight=False, train_topology=False)
+            num_active_neurons = 0
+            num_active_connections = 0
+            for weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive, output_nodes_alive in sequence:
+                num_active_neurons += activation_mask.value.shape[0]
+                num_active_connections += tf.size(weight_matrix.value)
 
-        test_loss(loss)
+            active_neurons(num_active_neurons)
+            active_connections(num_active_connections)
+            mean_depth(len(sequence))
+
+        if b_id == 2:
+            sequence, loss = apply_batch(batch, loss_function, train_weight=False, train_topology=False)
+
+            test_loss(loss)
+
+    end = time.time()
+    tf.print(f'One pass took: {end - start}')
 
     top_vars = test.get_topologie_variables_grouped()
     for k in range(int(len(top_vars))):

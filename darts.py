@@ -454,12 +454,12 @@ def apply_batch(batch, loss_function: Callable, train_weight: bool, train_topolo
     return sequence, loss
 
 
-def loss_function(y_true, y_pred):
-    probs = tf.math.softmax(y_pred, axis=-1)
-    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
-
 #def loss_function(y_true, y_pred):
-#    return tf.keras.losses.mean_squared_error(y_true, y_pred)
+#    probs = tf.math.softmax(y_pred, axis=-1)
+#    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
+
+def loss_function(y_true, y_pred):
+    return tf.keras.losses.mean_squared_error(y_true, y_pred)
 
 
 epoch = 0
