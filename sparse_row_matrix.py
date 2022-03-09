@@ -40,7 +40,7 @@ class SparseRowMatrix:
     def __matmul__(self, other):
         assert self.dense_shape[1] == other.dense_shape[0]
         if self.value.shape[0] == 0 or other.value.shape[0] == 0:
-            r_value = self.value * 0.0
+            r_value = tf.zeros(shape=(self.value.shape[0], other.dense_shape[-1]))
             r_indices = self.indices
             r = SparseRowMatrix(dense_shape=[self.dense_shape[0], other.dense_shape[-1]])
             r.indices = r_indices

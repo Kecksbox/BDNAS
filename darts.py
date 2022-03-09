@@ -6,7 +6,7 @@ import os
 
 from PIL import Image, ImageDraw
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+#os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 import pickle
 import random
@@ -15,159 +15,31 @@ from pathlib import Path
 from typing import List, Callable
 
 import tensorflow as tf
-from keras.optimizer_v2.optimizer_v2 import _var_key
+import tensorflow_addons as tfa
 
 from sparse_row_matrix import SparseRowMatrix
 
 tf.get_logger().setLevel('ERROR')
 
-learning_rate = 0.001
+learning_rate_weights = 0.0025
+weight_decay_weights = 0.0003
 
-conn_param_bias = 1 / 10000
-decay_limit = 1 / 500
+learning_rate_topo = 0.0003
+
+conn_param_bias = 0.001
+decay_limit = 1 / 99999999
 min_conn_param = 0.0 + conn_param_bias
 max_conn_param = 1.0 - conn_param_bias
-inital_virtual_layer_output_node_alive_prob = 1 / 1000
-inital_virtual_layer_output_node_alive_prob_to_input_layer = 1.0
+weight_bias = 0.0001
+
+a_estimate_lr = 0.001
+
+decay_interval = 100000
+log_interval = 1
+top_vis_intervall = 500
 
 
-
-@tf.custom_gradient
-def special_sub_action(a, b):
-    def grad(upstream):
-        return upstream, tf.zeros(shape=b.shape)
-
-    y = a - b
-    return y, grad
-
-
-@tf.custom_gradient
-def special_ceil_action(x):
-    def grad(upstream):
-        return upstream
-
-    y = tf.math.ceil(x)
-    return y, grad
-
-
-def binominal_sample_operation(probs):
-    sample = special_ceil_action(special_sub_action(probs, tf.random.uniform(tf.shape(probs))))
-
-    return sample
-
-
-def binary_gate_sigmoid(params):
-    tmp = tf.reshape(params.value, shape=(params.value.shape[0], -1))
-    tmp2 = SparseRowMatrix(dense_shape=[params.dense_shape[0], tmp.shape[1]])
-    tmp2.indices = params.indices
-    tmp2.value = tmp
-    probs = tmp2
-
-    sample = probs.operation(binominal_sample_operation)
-    return sample, probs
-
-
-@tf.custom_gradient
-def categorical_sample_operation(probs):
-    original_matrix_shape = probs.shape
-    probs_2d = tf.reshape(probs, shape=(-1, original_matrix_shape[-1]))
-    sample = tf.squeeze(tf.random.categorical(logits=tf.math.log(probs_2d), num_samples=1))
-    sample = tf.one_hot(sample, depth=probs_2d.shape[-1])  # on_value=True, off_value=False, dtype=tf.bool)
-    sample = tf.reshape(sample, shape=original_matrix_shape)
-
-    def grad(upstream):
-        return upstream
-
-    return sample, grad
-
-
-def binary_gate_softmax(params):
-    tmp = tf.reshape(params.value, shape=(params.value.shape[0], -1))
-    tmp = tf.math.softmax(tmp, axis=-1)
-    tmp2 = SparseRowMatrix(dense_shape=[params.dense_shape[0], tmp.shape[1]])
-    tmp2.indices = params.indices
-    tmp2.value = tmp
-    probs = tmp2
-
-    sample = probs.operation(categorical_sample_operation)
-    return sample, probs
-
-
-@tf.custom_gradient
-def check(weight_matrix: SparseRowMatrix, activation, previous_actvation_estimate):
-    def grad(upstream):
-        wm_grad_st = tf.matmul(upstream, tf.transpose(previous_actvation_estimate))
-        wm_grad = wm_grad_st
-        a_grad = tf.matmul(tf.transpose(weight_matrix), upstream)
-        previous_actvation_estimate_grad = tf.zeros(shape=previous_actvation_estimate.shape)
-        return wm_grad, a_grad, previous_actvation_estimate_grad
-
-    r = tf.matmul(weight_matrix, activation)
-
-    return r, grad
-
-
-def reduce_connection_mask_matrix_operation(a, num_input_nodes):
-    num_output_nodes = a.dense_shape[1] - num_input_nodes
-
-    tmp = a.value
-    mask = tf.reduce_sum(tmp, axis=0)
-    mask_div = mask + tf.maximum((1 - 1 * mask), 0.0)
-    tmp_reduced = (mask / mask_div)
-
-    return tmp_reduced[:num_output_nodes], tmp_reduced
-
-
-def assign_to_sparse_variable(var: SparseRowMatrix, value, index):
-    row_already_filled = var.indices[index]
-    previous_not_null_rows = tf.reduce_sum(tf.cast(var.indices[:index], dtype=tf.int32))
-    value = tf.expand_dims(value, axis=0)
-
-    optimizer = opt_topo
-    weights = []
-    slot_dict = optimizer._slots
-    var_key = _var_key(var.value)
-    if var_key in slot_dict:
-        slot = optimizer._slots[var_key]
-        weights = [slot['m'], slot['v']]
-
-    var.indices[index] = True
-    if not row_already_filled:
-        new_value = tf.concat([var.value[:previous_not_null_rows], value, var.value[previous_not_null_rows:]],
-                              axis=0)
-        for w in weights:
-            w._shape = [w.shape[0] + 1] + w.shape[1:]
-            w.assign(
-                tf.concat([w[:previous_not_null_rows], tf.zeros(shape=value.shape), w[previous_not_null_rows:]],
-                          axis=0)
-            )
-    else:
-        new_value = tf.concat(
-            [var.value[:previous_not_null_rows], value, var.value[previous_not_null_rows + 1:]],
-            axis=0)
-
-        for w in weights:
-            w.assign(
-                tf.concat(
-                    [w[:previous_not_null_rows], tf.zeros(shape=value.shape), w[previous_not_null_rows + 1:]],
-                    axis=0)
-            )
-
-    var.value.assign(new_value)
-
-
-def mul_by_alive_vector(target, alive_vector, init_function):
-    rows_to_init = tf.logical_and(tf.logical_not(target.indices), alive_vector)
-    for index in tf.where(rows_to_init):
-        assign_to_sparse_variable(target, init_function(), tf.squeeze(index))
-
-    # remove rows that are dead
-    b_alive_masked = tf.boolean_mask(alive_vector, target.indices)
-    target_masked = SparseRowMatrix(dense_shape=target.dense_shape)
-    target_masked.value = tf.boolean_mask(tf.stack(target.value), b_alive_masked)
-    target_masked.indices = tf.unstack(alive_vector)
-
-    return target, target_masked
+topology_batch_size = 10
 
 
 class InputLayer:
@@ -181,11 +53,12 @@ class InputLayer:
 
 activation_function_catalog = [
     tf.keras.activations.linear,
-    tf.keras.layers.LeakyReLU(),
+    tf.nn.leaky_relu,
     tf.keras.activations.tanh,
     tf.keras.activations.sigmoid,
 ]
 
+scaling_init = tf.keras.initializers.VarianceScaling()
 
 class Layer:
     def __init__(self, dim_input_layer: int, dim_previous_layer: int, dim_out: int):
@@ -196,79 +69,50 @@ class Layer:
         self.num_valid_input_nodes = self.dim_input_layer + self.dim_previous_layer
 
         self.connection_parameter = SparseRowMatrix(dense_shape=[dim_out, self.num_valid_input_nodes])
-        self.connection_parameter.value = tf.Variable(tf.zeros(shape=[0, self.num_valid_input_nodes]),
-                                                      shape=[None, self.num_valid_input_nodes])
+        self.connection_parameter.value = tf.Variable(
+            tf.concat([
+                tf.zeros(shape=(dim_out, self.dim_previous_layer,)),
+                tf.ones(shape=(dim_out, self.dim_input_layer,)),
+            ], axis=-1)
+        )
+        self.connection_parameter.indices = [True] * dim_out
 
         self.weight_matrix = SparseRowMatrix(dense_shape=[dim_out, self.num_valid_input_nodes])
-        self.weight_matrix.value = tf.Variable(tf.zeros(shape=[0, self.num_valid_input_nodes]),
-                                               shape=[None, self.num_valid_input_nodes])
-
-        self.layer_norm = tf.keras.layers.LayerNormalization()
+        self.weight_matrix.value = tf.Variable(scaling_init(shape=[dim_out, self.num_valid_input_nodes]))
+        self.weight_matrix.indices = [True] * dim_out
 
         self.activation_parameter = SparseRowMatrix(dense_shape=[dim_out, len(activation_function_catalog)])
-        self.activation_parameter.value = tf.Variable(tf.zeros(shape=[0, len(activation_function_catalog)]),
-                                                      shape=[None, len(activation_function_catalog)])
+        self.activation_parameter.value = tf.Variable(tf.math.softmax(tf.zeros(shape=[dim_out, len(activation_function_catalog)])))
+        self.activation_parameter.indices = [True] * dim_out
 
     def get_weight_variables(self):
         return [self.weight_matrix.value]
 
     def get_topologie_variables(self):
-        return [self.connection_parameter.value] + self.layer_norm.trainable_variables + [
-            self.activation_parameter.value]
+        return [self.connection_parameter.value, self.activation_parameter.value]
 
     def get_topologie_sparse_variables(self):
         return [self.connection_parameter] + [self.activation_parameter]
 
-    def init_connection_parameter(self):
-        y = inital_virtual_layer_output_node_alive_prob / self.dim_out
-        return tf.Variable(
-            tf.concat([
-                tf.constant(y, shape=(self.dim_previous_layer,)),
-                tf.constant(inital_virtual_layer_output_node_alive_prob_to_input_layer, shape=(self.dim_input_layer,))
-            ], axis=0)
-        )
-
-    def init_weight_parameter(self):
-        return tf.Variable(tf.random.normal(shape=(self.num_valid_input_nodes,)))
-
-    def init_activation_paramter(self):
-        return tf.Variable(tf.zeros(shape=(len(activation_function_catalog))))
-
     def sample_topologie(self, output_nodes_alive: SparseRowMatrix):
-        local_min_conn_paramparam = max(min_conn_param, inital_virtual_layer_output_node_alive_prob / self.dim_out)
         self.connection_parameter.value.assign(
-            tf.clip_by_value(self.connection_parameter.value, local_min_conn_paramparam, max_conn_param)
+            tf.clip_by_value(self.connection_parameter.value, min_conn_param, max_conn_param)
         )
 
-        self.connection_parameter, connection_parameter_masked = mul_by_alive_vector(self.connection_parameter,
-                                                                                     output_nodes_alive,
-                                                                                     init_function=self.init_connection_parameter)
+        connection_mask_matrix = self.connection_parameter
 
-        connection_mask_matrix, _ = binary_gate_sigmoid(connection_parameter_masked)
-
-        self.weight_matrix, weight_matrix_masked = mul_by_alive_vector(self.weight_matrix,
-                                                                       output_nodes_alive,
-                                                                       init_function=self.init_weight_parameter)
+        weight_matrix_masked = self.weight_matrix
 
         weight_matrix = SparseRowMatrix(dense_shape=weight_matrix_masked.dense_shape)
         weight_matrix.value = weight_matrix_masked.value * connection_mask_matrix.value
         weight_matrix.indices = weight_matrix_masked.indices
 
-        self.layer_norm_beta, layer_norm_beta = mul_by_alive_vector(self.layer_norm_beta,
-                                                                    output_nodes_alive,
-                                                                    init_function=self.init_layer_norm_beta)
-        self.layer_norm_gamma, layer_norm_gamma = mul_by_alive_vector(self.layer_norm_gamma,
-                                                                      output_nodes_alive,
-                                                                      init_function=self.init_layer_norm_gamma)
+        self.activation_parameter.value.assign(
+            tf.clip_by_value(self.activation_parameter.value, min_conn_param, max_conn_param)
+        )
+        activation_mask = self.activation_parameter
 
-        layer_norm = (layer_norm_beta, layer_norm_gamma)
-
-        self.activation_parameter, activation_parameter_masked = mul_by_alive_vector(self.activation_parameter,
-                                                                                     output_nodes_alive,
-                                                                                     init_function=self.init_activation_paramter)
-        activation_mask, _ = binary_gate_softmax(activation_parameter_masked)
-
-        return weight_matrix, connection_mask_matrix, activation_mask, self.layer_norm
+        return weight_matrix, connection_mask_matrix, activation_mask, None
 
 
 def apply_activation(activation, activation_mask):
@@ -285,6 +129,14 @@ def apply_activation(activation, activation_mask):
 
     return res
 
+def reduce_connection_mask_matrix_operation(a, num_input_nodes):
+    num_output_nodes = a.dense_shape[1] - num_input_nodes
+
+    tmp = a.value
+    mask = tf.reduce_sum(tmp, axis=0)
+    tmp_reduced = tf.math.divide_no_nan(mask, mask)
+
+    return tmp_reduced[:num_output_nodes], tmp_reduced
 
 class Network:
     def __init__(self, dim_in, dim_out, virtual_layers: List[Layer]):
@@ -351,7 +203,7 @@ class Network:
                 )
             )
 
-            if depth < len(self.hidden_layers) and tf.reduce_sum(input_nodes_alive_layer) > 0:
+            if depth < len(self.hidden_layers):
                 current_layer = self.get_hidden_layer(depth)
                 output_nodes_alive = input_nodes_alive_layer
 
@@ -394,55 +246,6 @@ class Network:
 
         return results
 
-    def decay(self, limit: float):
-        layers = [self.output_layer] + self.hidden_layers
-        alive_probabilities = self.calculate_alive_probabilities()
-        assert len(layers) == len(alive_probabilities)
-        for i in range(len(layers)):
-            virtual_layer = layers[i]
-            assert isinstance(virtual_layer, Layer)
-            output_nodes_alive_prob = alive_probabilities[i][0]
-
-            # remove rows by limit
-            tf.print(tf.reduce_mean(output_nodes_alive_prob))
-            decay_save_mask = tf.greater_equal(output_nodes_alive_prob, limit)
-
-            # remove connection paramter
-            target = virtual_layer.connection_parameter
-            b_alive_mask = tf.boolean_mask(decay_save_mask, target.indices)
-            target.value.assign(
-                tf.boolean_mask(target.value, b_alive_mask)
-            )
-            target.indices = tf.unstack(tf.logical_and(decay_save_mask, target.indices))
-            # remove estimates from adam optimizer
-            optimizer = opt_topo
-            slot_dict = optimizer._slots
-            var_key = _var_key(target.value)
-            if var_key in slot_dict:
-                slot = optimizer._slots[var_key]
-                for key in ['m', 'v']:
-                    slot[key] = tf.Variable(
-                        tf.boolean_mask(slot[key], b_alive_mask)
-                    )
-
-            # remove node parameter (activation)
-            target = virtual_layer.activation_parameter
-            b_alive_mask = tf.boolean_mask(decay_save_mask, target.indices)
-            target.value.assign(
-                tf.boolean_mask(target.value, b_alive_mask)
-            )
-            target.indices = tf.unstack(tf.logical_and(decay_save_mask, target.indices))
-            # remove estimates from adam optimizer
-            optimizer = opt_topo
-            slot_dict = optimizer._slots
-            var_key = _var_key(target.value)
-            if var_key in slot_dict:
-                slot = optimizer._slots[var_key]
-                for key in ['m', 'v']:
-                    slot[key] = tf.Variable(
-                        tf.boolean_mask(slot[key], b_alive_mask)
-                    )
-
     def __call__(self, input_batch, sequence, *args, **kwargs):
         sequence_length = len(sequence)
         input_batch, batch_activation_history = input_batch
@@ -452,33 +255,34 @@ class Network:
 
         first_hidden_layer_weights = sequence[-1][0]
         input = tf.transpose(input_batch)
-        activation = SparseRowMatrix(
-            dense_shape=[first_hidden_layer_weights.dense_shape[1] - num_input_nodes, input.shape[1]])
+        activation = tf.constant(0.0,
+                                 shape=(first_hidden_layer_weights.dense_shape[1] - num_input_nodes, input.shape[1]))
 
         i = 1
-        for weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive, _ in reversed(
+        for weight_matrix, connection_mask_matrix, activation_mask, batch_norm, input_nodes_alive, _ in reversed(
                 sequence):
 
-            activation = activation.concat_dense(input)
+            activation = tf.concat([activation, input], axis=0)
 
-            activation = activation.mul_dense(tf.expand_dims(input_nodes_alive, axis=-1))
-
-            start = time.time()
-            activation = weight_matrix.__matmul__(activation)
-            end = time.time()
-            # tf.print("matmul took: {}".format(end - start))
-
-            activation = apply_activation(activation, activation_mask)
+            weight_matrix.value = weight_matrix.value + tf.math.sign(weight_matrix.value) * weight_bias
+            r_value = tf.matmul(weight_matrix.value, activation)
+            r = SparseRowMatrix(dense_shape=[weight_matrix.dense_shape[0], activation.shape[-1]])
+            r.value = r_value
+            r.indices = list.copy(weight_matrix.indices)
+            activation = r
 
             if i < sequence_length:
-                activation.value = layer_norm(activation.value)
+                activation = apply_activation(activation, activation_mask)
+
+                activation_mean = tf.reduce_mean(activation.value, axis=-1, keepdims=True)
+                activation_std = tf.math.sqrt(
+                    tf.reduce_mean(tf.math.square(activation.value - activation_mean), axis=-1,
+                                   keepdims=True) + 0.001)
+                activation.value = (activation.value - activation_mean) / activation_std
 
             i += 1
 
-        start = time.time()
-        activation = activation.to_dense(0.0, tf.float32)
-        end = time.time()
-        # tf.print("activation.to_dense took: {}".format(end - start))
+            activation = activation.to_dense(0.0, tf.float32)
 
         return tf.transpose(activation)
 
@@ -503,25 +307,25 @@ class Network:
 checkpoint_path = "./checkpoints/check.json"
 
 test = Network.load(checkpoint_path)
-dim_input = 2
-dim_output = 1
+dim_input = 784
+dim_output = 10
 if test is None:
     test = Network(dim_input, dim_output, [
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 0, 40),
+        Layer(dim_input, 200, 200),
+        Layer(dim_input, 200, 200),
+        Layer(dim_input, 400, 200),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 400, 400),
+        Layer(dim_input, 0, 400),
     ])
 
-opt_topo = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-
-decay_interval = 100
-log_interval = 100
-top_vis_intervall = 500
+opt_weight = tfa.optimizers.SGDW(learning_rate=learning_rate_weights, momentum=0.9, weight_decay=weight_decay_weights)
+opt_topo = tf.keras.optimizers.Adam(learning_rate=learning_rate_topo, beta_1=0.5, beta_2=0.999, epsilon=1e-07)
 
 # work_dir = os.environ["WORK"]
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-train_log_dir = 'logs/gradient_tape/' + current_time + "sparse_node_mask_classic" + '/train'
+train_log_dir = 'logs/gradient_tape/' + current_time + "darts_test" + '/train'
 train_summary_writer = tf.summary.create_file_writer(train_log_dir)
 train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
 topology_loss = tf.keras.metrics.Mean('topology_loss', dtype=tf.float32)
@@ -565,14 +369,14 @@ y_train = y_train_split[1]
 x_topology = x_train_split[0, :, :]
 x_train = x_train_split[1, :, :]
 
-batches_train = 0
-batch_size_train = 100
+batches_train = 10
+batch_size_train = 200
 
-batches_topology = 1
+batches_topology = 10
 batch_size_topology = 200
 
-batches_test = 0
-batch_size_test = 200
+batches_test = 5
+batch_size_test = 100
 
 train_dataset = []
 for i in range(batches_train):
@@ -600,23 +404,6 @@ for i in range(batches_test):
 
 """ Load the DataSet End """
 
-test_input = tf.constant([
-    [0.0, 0.0],
-    [1.0, 0.0],
-    [0.0, 1.0],
-    [1.0, 1.0],
-])
-test_output = tf.constant([
-    [0.0],
-    [1.0],
-    [1.0],
-    [0.0],
-])
-
-topology_dataset = [
-    ((test_input, []), test_output)
-]
-
 
 def clip_grads_by_global_norm(grads, norm: float):
     types = [None] * len(grads)
@@ -637,107 +424,82 @@ def clip_grads_by_global_norm(grads, norm: float):
     return grads
 
 
-def apply_gradients(grads, variables):
-    grads = clip_grads_by_global_norm(grads, 5.0)
-
-    try:
-        slot_dict = opt_topo._slots
-        for var in variables:
-            var._shape = tf.shape(var)
-            var_key = _var_key(var)
-            if var_key in slot_dict:
-                var_slot = slot_dict[var_key]
-                var_m = var_slot['m']
-                if var_m.shape[0] != var.shape[0]:
-                    # remove m and v
-                    # This case should never occure in practice.
-                    raise AssertionError("Unexpexted shape difference in optimizer estimates.")
-                    """
-                    to_remove = [_var_key(var_m), _var_key(var_slot['v'])]
-                    for i in reversed(range(len(opt_topo.weights))):
-                        if _var_key(opt_topo.weights[i]) in to_remove:
-                            opt_topo.weights.pop(i)
-                    del slot_dict[var_key]
-                    """
-
-        opt_topo.apply_gradients(zip(grads, variables))
-        for var in variables:
-            var._shape = tf.TensorShape([None]).__concat__(var._shape[1:])
-    except ValueError:
-        pass
-
-
 def apply_batch(batch, loss_function: Callable, train_weight: bool, train_topology: bool):
     batch_x, batch_y = batch
 
     train = train_weight or train_topology
-    with tf.GradientTape() as topology_tape:
+    with tf.GradientTape() as tape:
         if not train:
-            topology_tape.stop_recording()
-        ## -----------------------------topology part--------------------------------------------------------
+            tape.stop_recording()
+
         sequence = test.sample_topologie()
 
         result_train = test(batch_x, sequence)
 
         loss = loss_function(batch_y, result_train)
+        tape.stop_recording()
 
-        variables = []
-        if train_weight:
-            variables += test.get_weight_variables()
-        if train_topology:
-            variables += test.get_topologie_variables()
-        grads = topology_tape.gradient(loss, variables)
+    w_variables = test.get_weight_variables()
 
-        apply_gradients(grads, variables)
+    t_variables = test.get_topologie_variables()
 
-        return sequence, loss
+    grads = tape.gradient(loss, w_variables + t_variables)
 
+    if train_weight:
+        opt_weight.apply_gradients(zip(grads[:len(w_variables)], w_variables))
 
-# def loss_function(y_true, y_pred):
-#    probs = tf.math.softmax(y_pred, axis=-1)
-#    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
+    if train_topology:
+        opt_topo.apply_gradients(zip(grads[len(w_variables):], t_variables))
+
+    return sequence, loss
+
 
 def loss_function(y_true, y_pred):
-    return tf.keras.losses.mean_squared_error(y_true, y_pred)
+    probs = tf.math.softmax(y_pred, axis=-1)
+    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
+
+#def loss_function(y_true, y_pred):
+#    return tf.keras.losses.mean_squared_error(y_true, y_pred)
 
 
 epoch = 0
 while True:
 
-    for batch in train_dataset:
-        sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=False)
-
-        train_loss(loss)
-
-    for batch in topology_dataset:
-
-        start = time.time()
-        sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=True)
-        end = time.time()
-        # tf.print("apply_batch took: {}".format(end - start))
-
-        topology_loss(loss)
-
-        num_active_neurons = 0
-        num_active_connections = 0
-        for weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive, output_nodes_alive in sequence:
-            num_active_neurons += tf.where(input_nodes_alive).shape[0]
-            num_active_connections += tf.where(connection_mask_matrix.value).shape[0]
-
-        active_neurons(num_active_neurons)
-        active_connections(num_active_connections)
-        mean_depth(len(sequence))
-
-    for batch in test_dataset:
-        sequence, loss = apply_batch(batch, loss_function, train_weight=False, train_topology=False)
-
-        test_loss(loss)
-
     start = time.time()
-    if epoch % decay_interval == 0:
-        test.decay(decay_limit)
+    batches = [(e, 0) for e in train_dataset] + [(e, 1) for e in topology_dataset] + [(e, 2) for e in test_dataset]
+    random.shuffle(batches)
+
+    for batch, b_id in batches:
+
+        if b_id == 0:
+            sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=False)
+
+            train_loss(loss)
+
+        if b_id == 1:
+
+            sequence, loss = apply_batch(batch, loss_function, train_weight=False, train_topology=True)
+            # tf.print("apply_batch took: {}".format(end - start))
+
+            topology_loss(loss)
+
+            num_active_neurons = 0
+            num_active_connections = 0
+            for weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive, output_nodes_alive in sequence:
+                num_active_neurons += activation_mask.value.shape[0]
+                num_active_connections += tf.size(weight_matrix.value)
+
+            active_neurons(num_active_neurons)
+            active_connections(num_active_connections)
+            mean_depth(len(sequence))
+
+        if b_id == 2:
+            sequence, loss = apply_batch(batch, loss_function, train_weight=False, train_topology=False)
+
+            test_loss(loss)
+
     end = time.time()
-    # tf.print("decay took: {}".format(end - start))
+    tf.print(f'One pass took: {end - start}')
 
     top_vars = test.get_topologie_variables_grouped()
     for k in range(int(len(top_vars))):
@@ -799,7 +561,7 @@ while True:
                 tf.summary.scalar('connection_uncertainty_l{}'.format(i), writer.result(), step=epoch)
             writer.reset_states()
 
-    if epoch % top_vis_intervall == 0:
+    if epoch % top_vis_intervall == 0 and False:
         tp_vars = test.get_topologie_sparse_variables()
         layer_vars = []
         max_nodes = dim_input

@@ -1,7 +1,10 @@
 import copy
 import datetime
+import json
 
 import os
+
+from PIL import Image, ImageDraw
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -12,20 +15,32 @@ from pathlib import Path
 from typing import List, Callable
 
 import tensorflow as tf
+import tensorflow_addons as tfa
 from keras.optimizer_v2.optimizer_v2 import _var_key
 
 from sparse_row_matrix import SparseRowMatrix
 
 tf.get_logger().setLevel('ERROR')
 
-conn_param_bias = 1 / 100000
+learning_rate_weights = 0.025
+weight_decay_weights = 0.0003
+
+learning_rate_topo = 0.0003
+
+conn_param_bias = 1 / 10000
+decay_limit = 1 / 99999999
 min_conn_param = 0.0 + conn_param_bias
 max_conn_param = 1.0 - conn_param_bias
-inital_virtual_layer_output_node_alive_prob = 0.01
-inital_input_layer_node_alive_prob = inital_virtual_layer_output_node_alive_prob
+weight_bias = 0.0001
 
 a_estimate_lr = 0.01
 
+decay_interval = 100000
+log_interval = 100
+top_vis_intervall = 500
+
+
+topology_batch_size = 20
 
 @tf.custom_gradient
 def special_sub_action(a, b):
@@ -105,10 +120,11 @@ def check(weight_matrix: SparseRowMatrix, activation, previous_actvation_estimat
 def reduce_connection_mask_matrix_operation(a, num_input_nodes):
     num_output_nodes = a.dense_shape[1] - num_input_nodes
 
-    tmp = tf.cast(a.value, dtype=tf.bool)[:, :num_output_nodes]
-    tmp_reduced = tf.reduce_any(tmp, axis=0)
+    tmp = a.value
+    mask = tf.reduce_sum(tmp, axis=0)
+    tmp_reduced = tf.math.divide_no_nan(mask, mask)
 
-    return tmp_reduced
+    return tmp_reduced[:num_output_nodes], tmp_reduced
 
 
 def assign_to_sparse_variable(var: SparseRowMatrix, value, index):
@@ -121,7 +137,7 @@ def assign_to_sparse_variable(var: SparseRowMatrix, value, index):
     slot_dict = optimizer._slots
     var_key = _var_key(var.value)
     if var_key in slot_dict:
-        slot = optimizer._slots[_var_key(var.value)]
+        slot = optimizer._slots[var_key]
         weights = [slot['m'], slot['v']]
 
     var.indices[index] = True
@@ -174,7 +190,7 @@ class InputLayer:
 
 activation_function_catalog = [
     tf.keras.activations.linear,
-    tf.keras.activations.relu,
+    tf.nn.leaky_relu,
     tf.keras.activations.tanh,
     tf.keras.activations.sigmoid,
 ]
@@ -196,8 +212,6 @@ class Layer:
         self.weight_matrix.value = tf.Variable(tf.zeros(shape=[0, self.num_valid_input_nodes]),
                                                shape=[None, self.num_valid_input_nodes])
 
-        self.layer_norm = tf.keras.layers.LayerNormalization()
-
         self.activation_parameter = SparseRowMatrix(dense_shape=[dim_out, len(activation_function_catalog)])
         self.activation_parameter.value = tf.Variable(tf.zeros(shape=[0, len(activation_function_catalog)]),
                                                       shape=[None, len(activation_function_catalog)])
@@ -206,22 +220,29 @@ class Layer:
         return [self.weight_matrix.value]
 
     def get_topologie_variables(self):
-        return [self.connection_parameter.value] + self.layer_norm.trainable_variables + [
-            self.activation_parameter.value]
+        return [self.connection_parameter.value, self.activation_parameter.value]
 
-    def init_connection_parameter(self):
-        y = inital_virtual_layer_output_node_alive_prob / self.dim_out
-        return tf.Variable(tf.constant(y, shape=(self.num_valid_input_nodes,)))
-
-    def init_weight_parameter(self):
-        return tf.Variable(tf.random.normal(shape=(self.num_valid_input_nodes,)))
+    def get_topologie_sparse_variables(self):
+        return [self.connection_parameter] + [self.activation_parameter]
 
     def init_activation_paramter(self):
-        return tf.Variable(tf.zeros(shape=(len(activation_function_catalog))))
+        return tf.Variable(tf.math.softmax(tf.zeros(shape=(len(activation_function_catalog),))))
+
+    def init_connection_parameter(self):
+        return tf.Variable(
+            tf.concat([
+                tf.zeros(shape=(self.dim_previous_layer,)),
+                tf.ones(shape=(self.dim_input_layer,)),
+            ], axis=0)
+        )
+
+    def init_weight_parameter(self):
+        return tf.Variable(tf.random.uniform(shape=(self.num_valid_input_nodes,)) / 1000)
 
     def sample_topologie(self, output_nodes_alive: SparseRowMatrix):
         self.connection_parameter.value.assign(
-            tf.clip_by_value(self.connection_parameter.value, min_conn_param, max_conn_param))
+            tf.clip_by_value(self.connection_parameter.value, min_conn_param, max_conn_param)
+        )
 
         self.connection_parameter, connection_parameter_masked = mul_by_alive_vector(self.connection_parameter,
                                                                                      output_nodes_alive,
@@ -237,12 +258,15 @@ class Layer:
         weight_matrix.value = weight_matrix_masked.value * connection_mask_matrix.value
         weight_matrix.indices = weight_matrix_masked.indices
 
+        self.activation_parameter.value.assign(
+            tf.clip_by_value(self.activation_parameter.value, min_conn_param, max_conn_param)
+        )
         self.activation_parameter, activation_parameter_masked = mul_by_alive_vector(self.activation_parameter,
                                                                                      output_nodes_alive,
                                                                                      init_function=self.init_activation_paramter)
-        activation_mask, _ = binary_gate_softmax(activation_parameter_masked)
+        activation_mask, _ = binary_gate_sigmoid(activation_parameter_masked)
 
-        return weight_matrix, connection_mask_matrix, activation_mask, self.layer_norm
+        return weight_matrix, connection_mask_matrix, activation_mask, None
 
 
 def apply_activation(activation, activation_mask):
@@ -285,6 +309,13 @@ class Network:
             variables += l.get_topologie_variables()
         return variables
 
+    def get_topologie_sparse_variables(self):
+        variables = []
+        variables += self.output_layer.get_topologie_sparse_variables()
+        for l in self.hidden_layers:
+            variables += l.get_topologie_sparse_variables()
+        return variables
+
     def get_topologie_variables_grouped(self):
         variables = []
         variables += [self.output_layer.connection_parameter.value]
@@ -301,63 +332,114 @@ class Network:
     def sample_topologie(self):
         sequence = []
         current_layer = self.output_layer
-        output_nodes_alive = tf.constant(True, shape=[current_layer.dim_out], dtype=tf.bool)
+        output_nodes_alive = tf.constant(1.0, shape=[current_layer.dim_out], dtype=tf.float32)
         depth = 0
         while True:
             weight_matrix, connection_mask_matrix, activation_mask, layer_norm = current_layer.sample_topologie(
-                output_nodes_alive)
+                tf.cast(output_nodes_alive, dtype=tf.bool)
+            )
 
-            input_nodes_alive = reduce_connection_mask_matrix_operation(connection_mask_matrix, self.input_layer.dim_in)
+            input_nodes_alive_layer, input_nodes_alive_full = reduce_connection_mask_matrix_operation(
+                connection_mask_matrix, self.input_layer.dim_in)
 
             sequence.append(
                 (
-                    weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive,
+                    weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive_full,
                     output_nodes_alive
                 )
             )
 
-            if depth < len(self.hidden_layers) and tf.reduce_any(input_nodes_alive):
+            if depth < len(self.hidden_layers) and tf.reduce_sum(input_nodes_alive_layer) > 0:
                 current_layer = self.get_hidden_layer(depth)
-                output_nodes_alive = input_nodes_alive
+                output_nodes_alive = input_nodes_alive_layer
 
                 depth += 1
             else:
                 break
         return sequence
 
-    def decay(self, limit: float):
+    def calculate_alive_probabilities(self):
+        results = []
+
         current_layer = self.output_layer
         output_nodes_alive_prob = tf.ones(shape=(current_layer.dim_out,))
         for virtual_layer in [self.output_layer] + self.hidden_layers:
             assert isinstance(virtual_layer, Layer)
 
+            alive_probabilities_connections = virtual_layer.connection_parameter
+            alive_probabilities_connections_masked = alive_probabilities_connections.mul_dense(
+                tf.expand_dims(output_nodes_alive_prob, axis=-1)
+            )
+
+            results.append(
+                (
+                    output_nodes_alive_prob,
+                    alive_probabilities_connections_masked,
+                )
+            )
+
+            # calculate probability for next layer
+            if tf.reduce_any(alive_probabilities_connections.indices):
+                a = 1 - alive_probabilities_connections_masked.value
+                num_input_nodes = self.input_layer.dim_in
+                num_output_nodes = a.shape[1] - num_input_nodes
+
+                output_nodes_alive_prob = 1 - tf.reduce_prod(a[:, :num_output_nodes], axis=0)
+            else:
+                output_nodes_alive_prob = tf.zeros(
+                    shape=(virtual_layer.num_valid_input_nodes - self.input_layer.dim_in,)
+                )
+
+        return results
+
+    def decay(self, limit: float):
+        layers = [self.output_layer] + self.hidden_layers
+        alive_probabilities = self.calculate_alive_probabilities()
+        assert len(layers) == len(alive_probabilities)
+        for i in range(len(layers)):
+            virtual_layer = layers[i]
+            assert isinstance(virtual_layer, Layer)
+            output_nodes_alive_prob = alive_probabilities[i][0]
+
             # remove rows by limit
             tf.print(tf.reduce_mean(output_nodes_alive_prob))
             decay_save_mask = tf.greater_equal(output_nodes_alive_prob, limit)
+
+            # remove connection paramter
             target = virtual_layer.connection_parameter
             b_alive_mask = tf.boolean_mask(decay_save_mask, target.indices)
             target.value.assign(
                 tf.boolean_mask(target.value, b_alive_mask)
             )
             target.indices = tf.unstack(tf.logical_and(decay_save_mask, target.indices))
+            # remove estimates from adam optimizer
+            optimizer = opt_topo
+            slot_dict = optimizer._slots
+            var_key = _var_key(target.value)
+            if var_key in slot_dict:
+                slot = optimizer._slots[var_key]
+                for key in ['m', 'v']:
+                    slot[key] = tf.Variable(
+                        tf.boolean_mask(slot[key], b_alive_mask)
+                    )
 
-            # calculate probability for next layer
-            if tf.reduce_any(target.indices):
-                alive_probabilities_connections = virtual_layer.connection_parameter
-                alive_probabilities_connections_masked = alive_probabilities_connections.mul_dense(
-                    tf.expand_dims(output_nodes_alive_prob, axis=-1)
-                )
-
-                a = 1 - alive_probabilities_connections_masked.value
-                num_input_nodes = self.input_layer.dim_in
-                num_output_nodes = a.shape[1] - num_input_nodes
-
-                result = 1 - tf.reduce_prod(a[:, :num_output_nodes], axis=0)
-                output_nodes_alive_prob = result
-            else:
-                output_nodes_alive_prob = tf.zeros(
-                    shape=(virtual_layer.num_valid_input_nodes - self.input_layer.dim_in,)
-                )
+            # remove node parameter (activation)
+            target = virtual_layer.activation_parameter
+            b_alive_mask = tf.boolean_mask(decay_save_mask, target.indices)
+            target.value.assign(
+                tf.boolean_mask(target.value, b_alive_mask)
+            )
+            target.indices = tf.unstack(tf.logical_and(decay_save_mask, target.indices))
+            # remove estimates from adam optimizer
+            optimizer = opt_topo
+            slot_dict = optimizer._slots
+            var_key = _var_key(target.value)
+            if var_key in slot_dict:
+                slot = optimizer._slots[var_key]
+                for key in ['m', 'v']:
+                    slot[key] = tf.Variable(
+                        tf.boolean_mask(slot[key], b_alive_mask)
+                    )
 
     def __call__(self, input_batch, sequence, *args, **kwargs):
         sequence_length = len(sequence)
@@ -372,10 +454,12 @@ class Network:
                                  shape=(first_hidden_layer_weights.dense_shape[1] - num_input_nodes, input.shape[1]))
 
         i = 1
-        for weight_matrix, connection_mask_matrix, activation_mask, layer_norm, input_nodes_alive, _ in reversed(
+        for weight_matrix, connection_mask_matrix, activation_mask, batch_norm, input_nodes_alive, _ in reversed(
                 sequence):
 
             input_nodes_alive = tf.cast(input_nodes_alive, tf.float32)
+
+            input_nodes_alive = input_nodes_alive[:-num_input_nodes]
 
             history_index = -1 * (i - sequence_length)
             if history_index >= len(batch_activation_history):
@@ -385,35 +469,33 @@ class Network:
                 batch_activation_history[history_index] = tf.zeros(shape=activation.shape)
             else:
                 batch_activation_history[history_index] += (a_estimate_lr * (
-                        activation - batch_activation_history[history_index])) * tf.expand_dims(input_nodes_alive,
-                                                                                                axis=-1)
+                        activation - batch_activation_history[history_index])) * tf.expand_dims(input_nodes_alive, axis=-1)
 
             previous_activation = batch_activation_history[history_index] * tf.expand_dims(
-                tf.cast(tf.logical_not(tf.cast(input_nodes_alive, dtype=tf.bool)), dtype=tf.float32),
+                (1 - input_nodes_alive),
                 axis=-1) + activation * tf.expand_dims(input_nodes_alive, axis=-1)
 
             activation = tf.concat([activation, input], axis=0)
 
-            start = time.time()
+            weight_matrix.value = weight_matrix.value + tf.math.sign(weight_matrix.value) * weight_bias
             r_value = check(weight_matrix.value, activation, tf.concat([previous_activation, input], axis=0))
             r = SparseRowMatrix(dense_shape=[weight_matrix.dense_shape[0], activation.shape[-1]])
             r.value = r_value
             r.indices = list.copy(weight_matrix.indices)
             activation = r
-            end = time.time()
-            # tf.print("matmul took: {}".format(end - start))
-
-            activation = apply_activation(activation, activation_mask)
 
             if i < sequence_length:
-                activation.value = layer_norm(activation.value)
+                activation = apply_activation(activation, activation_mask)
+
+                activation_mean = tf.reduce_mean(activation.value, axis=-1, keepdims=True)
+                activation_std = tf.math.sqrt(
+                    tf.reduce_mean(tf.math.square(activation.value - activation_mean), axis=-1,
+                                   keepdims=True) + 0.001)
+                activation.value = (activation.value - activation_mean) / activation_std
 
             i += 1
 
-            start = time.time()
             activation = activation.to_dense(0.0, tf.float32)
-            end = time.time()
-            # tf.print("activation.to_dense took: {}".format(end - start))
 
         return tf.transpose(activation)
 
@@ -442,16 +524,17 @@ dim_input = 2
 dim_output = 1
 if test is None:
     test = Network(dim_input, dim_output, [
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 40, 40),
-        Layer(dim_input, 0, 40),
+        Layer(dim_input, 80, 80),
+        Layer(dim_input, 80, 80),
+        Layer(dim_input, 0, 80),
     ])
-opt_topo = tf.keras.optimizers.Adam(learning_rate=0.001)
+
+opt_weight = tfa.optimizers.SGDW(learning_rate=learning_rate_weights, weight_decay=weight_decay_weights)
+opt_topo = tf.keras.optimizers.Adam(learning_rate=learning_rate_topo, beta_1=0.5, beta_2=0.999, epsilon=1e-07)
 
 # work_dir = os.environ["WORK"]
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-train_log_dir = 'logs/gradient_tape/' + current_time + "sparse_a_evaluation" + '/train'
+train_log_dir = 'logs/gradient_tape/' + current_time + "sparse_a_estimator_test" + '/train'
 train_summary_writer = tf.summary.create_file_writer(train_log_dir)
 train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
 topology_loss = tf.keras.metrics.Mean('topology_loss', dtype=tf.float32)
@@ -459,6 +542,13 @@ test_loss = tf.keras.metrics.Mean('test_loss', dtype=tf.float32)
 active_neurons = tf.keras.metrics.Mean('active_neurons', dtype=tf.float32)
 active_connections = tf.keras.metrics.Mean('active_connections', dtype=tf.float32)
 mean_depth = tf.keras.metrics.Mean('mean_depth', dtype=tf.float32)
+memory_used = tf.keras.metrics.Mean('memory_used', dtype=tf.float32)
+
+tp_cp_path = f'logs/topology_checkpoints/{time.strftime("%Y%m%d-%H%M%S")}/'
+if os.path.exists(tp_cp_path):
+    os.remove(tp_cp_path)
+if not os.path.exists(tp_cp_path):
+    os.makedirs(tp_cp_path)
 
 layers = [test.output_layer] + test.hidden_layers
 params_writers = []
@@ -560,105 +650,53 @@ def clip_grads_by_global_norm(grads, norm: float):
     return grads
 
 
-def apply_batch(batch, loss_function: Callable, bweights: bool, btopology: bool):
+def apply_gradients_topo(grads, variables):
+    slot_dict = opt_topo._slots
+    for var in variables:
+        var._shape = tf.shape(var)
+        var_key = _var_key(var)
+        if var_key in slot_dict:
+            var_slot = slot_dict[var_key]
+            var_m = var_slot['m']
+            if var_m.shape[0] != var.shape[0]:
+                # remove m and v
+                # This case should never occure in practice.
+                raise AssertionError("Unexpexted shape difference in optimizer estimates.")
+
+    opt_topo.apply_gradients(zip(grads, variables))
+    for var in variables:
+        var._shape = tf.TensorShape([None]).__concat__(var._shape[1:])
+
+
+def apply_gradients_weights(grads, variables):
+    opt_weight.apply_gradients(zip(grads, variables))
+
+
+def apply_batch(batch, loss_function: Callable, train_weight: bool, train_topology: bool):
     batch_x, batch_y = batch
 
-    assert not (btopology and not bweights)
-
-    with tf.GradientTape(persistent=False) as topology_tape:
-        if not btopology:
+    train = train_weight or train_topology
+    with tf.GradientTape() as topology_tape:
+        if not train:
             topology_tape.stop_recording()
 
-        with tf.GradientTape(persistent=False) as weight_tape:
-            if not weight_tape:
-                weight_tape.stop_recording()
+        sequence = test.sample_topologie()
 
-            start = time.time()
-            sequence = test.sample_topologie()
-            end = time.time()
-            # tf.print("sample_topology took: {}".format(end - start))
-
-            start = time.time()
-            result_train = test(batch_x, sequence)
-            end = time.time()
-            # tf.print("call took: {}".format(end - start))
-
-            loss = loss_function(batch_y, result_train)
-
-            start = time.time()
-            variables = []
-            if bweights:
-                variables += test.get_weight_variables()
-            grads = weight_tape.gradient(loss, variables)
-
-            grads = clip_grads_by_global_norm(grads, 1.0)
-
-            try:
-                slot_dict = opt_topo._slots
-                for var in variables:
-                    var._shape = tf.shape(var)
-                    var_key = _var_key(var)
-                    if var_key in slot_dict:
-                        var_slot = slot_dict[var_key]
-                        var_m = var_slot['m']
-                        if var_m.shape[0] != var.shape[0]:
-                            # remove m and v
-                            to_remove = [_var_key(var_m), _var_key(var_slot['v'])]
-                            for i in reversed(range(len(opt_topo.weights))):
-                                if _var_key(opt_topo.weights[i]) in to_remove:
-                                    opt_topo.weights.pop(i)
-                            del slot_dict[var_key]
-
-                opt_topo.apply_gradients(zip(grads, variables))
-                for var in variables:
-                    var._shape = tf.TensorShape([None]).__concat__(var._shape[1:])
-            except ValueError:
-                pass
-            end = time.time()
-            # tf.print("apply_gradients took: {}".format(end - start))
-
-        ## -----------------------------topology part--------------------------------------------------------
-
-        start = time.time()
         result_train = test(batch_x, sequence)
-        end = time.time()
-        # tf.print("call took: {}".format(end - start))
 
         loss = loss_function(batch_y, result_train)
 
-        start = time.time()
-        variables = []
-        if bweights:
-            variables += test.get_topologie_variables()
-        grads = topology_tape.gradient(loss, variables)
+    w_variables = test.get_weight_variables()
 
-        grads = clip_grads_by_global_norm(grads, 1.0)
+    t_variables = test.get_topologie_variables()
 
-        try:
-            slot_dict = opt_topo._slots
-            for var in variables:
-                var._shape = tf.shape(var)
-                var_key = _var_key(var)
-                if var_key in slot_dict:
-                    var_slot = slot_dict[var_key]
-                    var_m = var_slot['m']
-                    if var_m.shape[0] != var.shape[0]:
-                        # remove m and v
-                        to_remove = [_var_key(var_m), _var_key(var_slot['v'])]
-                        for i in reversed(range(len(opt_topo.weights))):
-                            if _var_key(opt_topo.weights[i]) in to_remove:
-                                opt_topo.weights.pop(i)
-                        del slot_dict[var_key]
+    grads = topology_tape.gradient(loss, w_variables + t_variables)
 
-            opt_topo.apply_gradients(zip(grads, variables))
-            for var in variables:
-                var._shape = tf.TensorShape([None]).__concat__(var._shape[1:])
-        except ValueError:
-            pass
-        end = time.time()
-        # tf.print("apply_gradients took: {}".format(end - start))
+    apply_gradients_weights(grads[:len(w_variables)], w_variables)
 
-        return sequence, loss
+    apply_gradients_topo(grads[len(w_variables):], t_variables)
+
+    return sequence, loss
 
 
 # def loss_function(y_true, y_pred):
@@ -673,14 +711,14 @@ epoch = 0
 while True:
 
     for batch in train_dataset:
-        sequence, loss = apply_batch(batch, loss_function, bweights=True, btopology=False)
+        sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=False)
 
         train_loss(loss)
 
     for batch in topology_dataset:
 
         start = time.time()
-        sequence, loss = apply_batch(batch, loss_function, bweights=True, btopology=True)
+        sequence, loss = apply_batch(batch, loss_function, train_weight=True, train_topology=True)
         end = time.time()
         # tf.print("apply_batch took: {}".format(end - start))
 
@@ -697,36 +735,15 @@ while True:
         mean_depth(len(sequence))
 
     for batch in test_dataset:
-        sequence, loss = apply_batch(batch, loss_function, bweights=False, btopology=False)
+        sequence, loss = apply_batch(batch, loss_function, train_weight=False, train_topology=False)
 
         test_loss(loss)
 
     start = time.time()
-    test.decay(0.0001)
+    #if epoch % decay_interval == 0:
+        #test.decay(decay_limit)
     end = time.time()
     # tf.print("decay took: {}".format(end - start))
-
-    with train_summary_writer.as_default():
-        tf.summary.scalar('train_loss', train_loss.result(), step=epoch)
-    with train_summary_writer.as_default():
-        tf.summary.scalar('topology_loss', topology_loss.result(), step=epoch)
-    with train_summary_writer.as_default():
-        tf.summary.scalar('test_loss', test_loss.result(), step=epoch)
-    train_loss.reset_states()
-    topology_loss.reset_states()
-    test_loss.reset_states()
-
-    with train_summary_writer.as_default():
-        tf.summary.scalar('active_neurons', active_neurons.result(), step=epoch)
-    with train_summary_writer.as_default():
-        tf.summary.scalar('active_connections', active_connections.result(), step=epoch)
-    with train_summary_writer.as_default():
-        tf.summary.scalar('mean_depth', mean_depth.result(), step=epoch)
-    active_neurons.reset_states()
-    active_connections.reset_states()
-    mean_depth.reset_states()
-
-    epoch += 1
 
     top_vars = test.get_topologie_variables_grouped()
     for k in range(int(len(top_vars))):
@@ -745,18 +762,164 @@ while True:
                 continue
             writer(tf.reduce_mean(uncertainty))
 
-    for i in range(len(params_writers)):
-        writer = params_writers[i]
+    # memory consumtion
+    all_vars = test.get_topologie_variables() + test.get_weight_variables()
+    memory_size = 0
+    for var in all_vars:
+        memory_size += tf.size(var)
+    memory_used(memory_size)
+
+    if epoch % log_interval == 0:
         with train_summary_writer.as_default():
-            tf.summary.scalar('connection_param_l{}'.format(i), writer.result(), step=epoch)
-        writer.reset_states()
-    for i in range(len(uncertainty_writers)):
-        writer = uncertainty_writers[i]
+            tf.summary.scalar('train_loss', train_loss.result(), step=epoch)
         with train_summary_writer.as_default():
-            tf.summary.scalar('connection_uncertainty_l{}'.format(i), writer.result(), step=epoch)
-        writer.reset_states()
+            tf.summary.scalar('topology_loss', topology_loss.result(), step=epoch)
+        with train_summary_writer.as_default():
+            tf.summary.scalar('test_loss', test_loss.result(), step=epoch)
+        train_loss.reset_states()
+        topology_loss.reset_states()
+        test_loss.reset_states()
+
+        with train_summary_writer.as_default():
+            tf.summary.scalar('active_neurons', active_neurons.result(), step=epoch)
+        with train_summary_writer.as_default():
+            tf.summary.scalar('active_connections', active_connections.result(), step=epoch)
+        with train_summary_writer.as_default():
+            tf.summary.scalar('mean_depth', mean_depth.result(), step=epoch)
+        active_neurons.reset_states()
+        active_connections.reset_states()
+        mean_depth.reset_states()
+
+        with train_summary_writer.as_default():
+            tf.summary.scalar('memory_used', memory_used.result(), step=epoch)
+        memory_used.reset_states()
+
+        for i in range(len(params_writers)):
+            writer = params_writers[i]
+            with train_summary_writer.as_default():
+                tf.summary.scalar('connection_param_l{}'.format(i), writer.result(), step=epoch)
+            writer.reset_states()
+        for i in range(len(uncertainty_writers)):
+            writer = uncertainty_writers[i]
+            with train_summary_writer.as_default():
+                tf.summary.scalar('connection_uncertainty_l{}'.format(i), writer.result(), step=epoch)
+            writer.reset_states()
+
+    if epoch % top_vis_intervall == 0:
+        tp_vars = test.get_topologie_sparse_variables()
+        layer_vars = []
+        max_nodes = dim_input
+        for i in range(int(len(tp_vars) / 2)):
+            layer_vars.append((
+                tp_vars[i*2].value.numpy(),
+                tp_vars[i*2 + 1].value.numpy(),
+                tp_vars[i*2 + 1].indices,
+            ))
+            activation_vars = layer_vars[-1][1]
+            if activation_vars.shape[0] > max_nodes:
+                max_nodes = activation_vars.shape[0]
+
+        alive_probabilities = test.calculate_alive_probabilities()
+
+        # create graph
+        image_size = (1000, 1000)
+        image = Image.new('RGBA', image_size)
+        draw_image = ImageDraw.Draw(image, 'RGBA')
+        draw_image.rectangle((0, 0, image_size[0], image_size[1]), fill='black')
+
+        num_layers = len(layer_vars) + 1
+        layer_box_max_width = image_size[0] / num_layers
+        layer_box_max_hight = image_size[1] / max_nodes
+        node_size = min(layer_box_max_width, layer_box_max_hight) / 3
+        width_padding = (layer_box_max_width - node_size) / 2
+        height_padding = (layer_box_max_hight - node_size) / 2
+
+        w_space_needed = node_size * num_layers + (num_layers - 1) * width_padding
+        outer_width_padding = (image_size[0] - w_space_needed) / 2
+
+        old_centers = []
+        known_nodes_in_previous_layer = []
+        for i in range(num_layers):
+            new_centers = []
+            if i == 0:
+                num_nodes = dim_input
+                num_connections = 0
+                known_nodes_in_current_layer = [True] * dim_input
+                node_alive_probability = [1.0] * dim_input
+                conn_alive_probability = SparseRowMatrix([0])
+            else:
+                conn_vars, activation_vars, known_nodes_in_current_layer = layer_vars[-i]
+                node_alive_probability, conn_alive_probability = alive_probabilities[-i]
+
+                if i < num_layers - 1:
+                    num_nodes = activation_vars.shape[0] + dim_input
+                    num_connections = conn_vars.shape[-1]
+                    known_nodes_in_current_layer = known_nodes_in_current_layer + [True] * dim_input
+                    node_alive_probability = tf.concat([node_alive_probability, tf.ones(shape=(dim_input,))], axis=0)
+                else:
+                    num_nodes = activation_vars.shape[0]
+                    num_connections = conn_vars.shape[-1]
+                    known_nodes_in_current_layer = known_nodes_in_current_layer
+                    node_alive_probability = node_alive_probability
+
+            known_nodes_in_current_layer_ids = tf.where(known_nodes_in_current_layer)
+
+            h_space_needed = num_nodes * node_size + (num_nodes - 1) * height_padding
+            outer_height_padding = (image_size[1] - h_space_needed) / 2
+
+            offset = [
+                outer_width_padding + i * (width_padding + node_size),
+                outer_height_padding,
+            ]
+            for j in range(num_nodes):
+                node_id = tf.squeeze(known_nodes_in_current_layer_ids[j])
+                alpha = int(node_alive_probability[node_id] * 255)
+
+                transp_tmp = Image.new('RGBA', image_size, (0, 0, 0, 0))
+                draw = ImageDraw.Draw(transp_tmp, "RGBA")
+
+                local_center = (offset[0] + (node_size / 2), offset[1] + (node_size / 2))
+                new_centers.append(local_center)
+                draw.ellipse((offset[0], offset[1], offset[0] + node_size, offset[1] + node_size), fill=(255, 255, 255, alpha))
+
+                image.paste(Image.alpha_composite(image, transp_tmp))
+
+                offset[1] += node_size + height_padding
+
+                if node_id >= conn_alive_probability.dense_shape[0]:
+                    continue
+
+                if conn_alive_probability.indices[node_id]:
+                    value_index = tf.reduce_sum(tf.cast(conn_alive_probability.indices[:node_id], dtype=tf.int32))
+                    node_conn_alive_probs = conn_alive_probability.value[value_index]
+                else:
+                    node_conn_alive_probs = tf.zeros(shape=(num_connections,))
+
+                start_center = local_center
+                center_index = 0
+                for z in range(num_connections):
+                    if not known_nodes_in_previous_layer[z]:
+                        continue
+                    target_center = old_centers[center_index]
+                    center_index += 1
+
+                    transp_tmp = Image.new('RGBA', image_size, (0, 0, 0, 0))
+                    draw = ImageDraw.Draw(transp_tmp, "RGBA")
+
+                    alpha2 = int(node_conn_alive_probs[z] * 255)
+
+                    draw.line((start_center[0], start_center[1], target_center[0], target_center[1]), fill=(255, 255, 255, alpha2))
+                    image.paste(Image.alpha_composite(image, transp_tmp))
+
+            old_centers = new_centers
+            known_nodes_in_previous_layer = known_nodes_in_current_layer
+
+
+        image.save(tp_cp_path + f'alive_{epoch}.png')
 
     if epoch % 5000 == 0:
         # test.save(checkpoint_path)
         # test = Network.load(checkpoint_path)
         pass
+
+    epoch += 1
