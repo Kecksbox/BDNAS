@@ -97,15 +97,16 @@ def binary_gate_sigmoid(params):
 
 
 @tf.custom_gradient()
-def check(weight_matrix: SparseRowMatrix, activation, previous_actvation_estimate):
+def check(weight_matrix, connection_mask_matrix, activation):
     def grad(upstream):
-        wm_grad_st = tf.matmul(upstream, tf.transpose(previous_actvation_estimate))
-        wm_grad = wm_grad_st
-        a_grad = tf.matmul(tf.transpose(weight_matrix), upstream)
-        previous_actvation_estimate_grad = tf.zeros(shape=previous_actvation_estimate.shape)
-        return wm_grad, a_grad, previous_actvation_estimate_grad
+        a_grad = tf.matmul(tf.transpose(weight_matrix * connection_mask_matrix), upstream)
+        normal_wm_grad = tf.matmul(upstream, tf.transpose(activation))
+        w_grad = normal_wm_grad * connection_mask_matrix
+        st_wm_grad = tf.matmul(upstream, tf.transpose(tf.ones(shape=activation.shape)))
+        cm_grad = st_wm_grad * weight_matrix
+        return w_grad, cm_grad, a_grad
 
-    r = tf.matmul(weight_matrix, activation)
+    r = tf.matmul(weight_matrix * connection_mask_matrix, activation)
 
     return r, grad
 
@@ -193,24 +194,24 @@ class Layer:
             tf.clip_by_value(self.connection_parameter.value, min_conn_param, max_conn_param)
         )
 
-        connection_mask_matrix = self.connection_parameter
-        if best_choice_only_mode:
-            connection_mask_matrix, _ = binary_gate_sigmoid(connection_mask_matrix)
+        self.connection_parameter, connection_parameter_masked = mul_by_alive_vector(self.connection_parameter,
+                                                                                     output_nodes_alive)
 
-        weight_matrix_masked = self.weight_matrix
+        connection_mask_matrix, _ = binary_gate_sigmoid(connection_parameter_masked)
 
-        weight_matrix = SparseRowMatrix(dense_shape=weight_matrix_masked.dense_shape)
-        weight_matrix.value = weight_matrix_masked.value * connection_mask_matrix.value
-        weight_matrix.indices = weight_matrix_masked.indices
+        self.weight_matrix, weight_matrix_masked = mul_by_alive_vector(self.weight_matrix,
+                                                                       output_nodes_alive)
+
+        weight_matrix = weight_matrix_masked
 
         self.activation_parameter.value.assign(
             tf.clip_by_value(self.activation_parameter.value, min_conn_param, max_conn_param)
         )
-        activation_mask = self.activation_parameter
-        if best_choice_only_mode:
-            activation_mask, _ = binary_gate_sigmoid(activation_mask)
+        self.activation_parameter, activation_parameter_masked = mul_by_alive_vector(self.activation_parameter,
+                                                                                     output_nodes_alive)
+        activation_mask, _ = binary_gate_sigmoid(activation_parameter_masked)
 
-        return weight_matrix, connection_mask_matrix, activation_mask
+        return weight_matrix, connection_mask_matrix, activation_mask, None
 
 
 def apply_activation(activation, activation_mask):
@@ -283,7 +284,7 @@ class Network:
         output_nodes_alive = tf.constant(1.0, shape=[current_layer.dim_out], dtype=tf.float32)
         depth = 0
         while True:
-            weight_matrix, connection_mask_matrix, activation_mask = current_layer.sample_topologie(
+            weight_matrix, connection_mask_matrix, activation_mask, layer_norm = current_layer.sample_topologie(
                 tf.cast(output_nodes_alive, dtype=tf.bool)
             )
 
@@ -296,7 +297,7 @@ class Network:
                 )
             )
 
-            if depth < len(self.hidden_layers):
+            if depth < len(self.hidden_layers) and tf.reduce_sum(input_nodes_alive_layer) > 0:
                 current_layer = self.get_hidden_layer(depth)
                 output_nodes_alive = input_nodes_alive_layer
 
@@ -348,16 +349,21 @@ class Network:
 
         first_hidden_layer_weights = sequence[-1][0]
         input = tf.transpose(input_batch)
-        activation = SparseRowMatrix(
-            dense_shape=[first_hidden_layer_weights.dense_shape[1] - num_input_nodes, input.shape[1]])
+        activation = tf.constant(0.0,
+                                 shape=(first_hidden_layer_weights.dense_shape[1] - num_input_nodes, input.shape[1]))
 
         i = 1
         for weight_matrix, connection_mask_matrix, activation_mask, input_nodes_alive in reversed(
                 sequence):
 
-            activation = activation.concat_dense(input)
+            activation = tf.concat([activation, input], axis=0)
 
-            activation = weight_matrix.__matmul__(activation)
+            weight_matrix.value = weight_matrix.value + tf.math.sign(weight_matrix.value) * weight_bias
+            r_value = check(weight_matrix.value, connection_mask_matrix.value, activation)
+            r = SparseRowMatrix(dense_shape=[weight_matrix.dense_shape[0], activation.shape[-1]])
+            r.value = r_value
+            r.indices = list.copy(weight_matrix.indices)
+            activation = r
 
             if i < sequence_length:
                 activation = apply_activation(activation, activation_mask)
@@ -370,7 +376,7 @@ class Network:
 
             i += 1
 
-        activation = activation.to_dense(0.0, tf.float32)
+            activation = activation.to_dense(0.0, tf.float32)
 
         return tf.transpose(activation)
 
@@ -563,7 +569,11 @@ def clip_grads_by_global_norm(grads, norm: float):
 def apply_batch(batch, loss_function: Callable, train_weight: bool, train_topology: bool):
     batch_x, batch_y = batch
 
+    train = train_weight or train_topology
     with tf.GradientTape() as tape:
+        if not train:
+            tape.stop_recording()
+
         loss = 0.0
         if not train_topology:
             local_topology_batch_size = 1

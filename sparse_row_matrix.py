@@ -81,7 +81,7 @@ class SparseRowMatrix:
             other_sparse
         )
 
-    def to_dense(self, off_value, dtype: tf.DType):
+    def to_dense(self, off_value, dtype: tf.DType = tf.float32):
         values = tf.cast(self.value, dtype)
         # fill room between all active rows
         active_rows = tf.squeeze(tf.where(self.indices), axis=-1)
