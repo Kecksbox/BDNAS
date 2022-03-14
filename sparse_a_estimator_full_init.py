@@ -17,6 +17,8 @@ import tensorflow_addons as tfa
 
 from sparse_row_matrix import SparseRowMatrix
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 random.seed(0)
 tf.random.set_seed(0)
 
@@ -27,7 +29,7 @@ weight_decay_weights = 0.0003
 
 learning_rate_topo = 0.0003
 
-conn_param_bias = 0.001
+conn_param_bias = 0.0001
 decay_limit = 1 / 99999999
 min_conn_param = 0.0 + conn_param_bias
 max_conn_param = 1.0 - conn_param_bias
@@ -44,7 +46,7 @@ top_vis_intervall = 500
 topology_batch_size = 1
 
 # this means the loaded weights will be reset at the start and only most prob choice will be picked.
-best_choice_only_mode = False
+best_choice_only_mode = True
 
 version_name = "sparse_a_estimator_test_sequential"
 
@@ -53,7 +55,7 @@ work_dir = "."
 
 
 # For debug purpose
-use_xor_set = False
+use_xor_set = True
 
 
 @tf.custom_gradient
@@ -435,13 +437,14 @@ dim_input = 784
 dim_output = 10
 if test is None:
     test = Network(dim_input, dim_output, [
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 0, 400),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 0, 1000),
     ])
 
 if best_choice_only_mode:

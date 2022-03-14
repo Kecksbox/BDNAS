@@ -17,6 +17,8 @@ import tensorflow_addons as tfa
 
 from sparse_row_matrix import SparseRowMatrix
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 random.seed(0)
 tf.random.set_seed(0)
 
@@ -27,7 +29,7 @@ weight_decay_weights = 0.0003
 
 learning_rate_topo = 0.0003
 
-conn_param_bias = 0.001
+conn_param_bias = 0.0001
 decay_limit = 1 / 99999999
 min_conn_param = 0.0 + conn_param_bias
 max_conn_param = 1.0 - conn_param_bias
@@ -44,16 +46,16 @@ top_vis_intervall = 500
 topology_batch_size = 1
 
 # this means the loaded weights will be reset at the start and only most prob choice will be picked.
-best_choice_only_mode = False
+best_choice_only_mode = True
 
-version_name = "sparse_a_estimator_test_sequential"
+version_name = "bats_test_sequential"
 
 work_dir = "."
 # work_dir = os.environ["WORK"]
 
 
 # For debug purpose
-use_xor_set = False
+use_xor_set = True
 
 
 @tf.custom_gradient
@@ -188,20 +190,31 @@ class Layer:
         self.weight_matrix.value = tf.Variable(scaling_init(shape=[self.dim_out, self.num_valid_input_nodes]))
         self.weight_matrix.indices = [True] * self.dim_out
 
-    def sample_topologie(self, output_nodes_alive: SparseRowMatrix):
+    def sample_topologie(self, output_nodes_alive):
+        output_nodes_alive = tf.constant(True, shape=output_nodes_alive.shape, dtype=tf.bool)
+
         self.connection_parameter.value.assign(
             tf.clip_by_value(self.connection_parameter.value, min_conn_param, max_conn_param)
         )
-        connection_mask_matrix, _ = binary_gate_sigmoid(self.connection_parameter)
 
-        weight_matrix = SparseRowMatrix(dense_shape=self.weight_matrix.dense_shape)
-        weight_matrix.value = self.weight_matrix.value * connection_mask_matrix.value
-        weight_matrix.indices = self.weight_matrix.indices
+        self.connection_parameter, connection_parameter_masked = mul_by_alive_vector(self.connection_parameter,
+                                                                                     output_nodes_alive)
+
+        connection_mask_matrix, _ = binary_gate_sigmoid(connection_parameter_masked)
+
+        self.weight_matrix, weight_matrix_masked = mul_by_alive_vector(self.weight_matrix,
+                                                                       output_nodes_alive)
+
+        weight_matrix = SparseRowMatrix(dense_shape=weight_matrix_masked.dense_shape)
+        weight_matrix.value = weight_matrix_masked.value * connection_mask_matrix.value
+        weight_matrix.indices = weight_matrix_masked.indices
 
         self.activation_parameter.value.assign(
             tf.clip_by_value(self.activation_parameter.value, min_conn_param, max_conn_param)
         )
-        activation_mask, _ = binary_gate_sigmoid(self.activation_parameter)
+        self.activation_parameter, activation_parameter_masked = mul_by_alive_vector(self.activation_parameter,
+                                                                                     output_nodes_alive)
+        activation_mask, _ = binary_gate_sigmoid(activation_parameter_masked)
 
         return weight_matrix, connection_mask_matrix, activation_mask, None
 
@@ -350,6 +363,7 @@ class Network:
 
             activation = activation.concat_dense(input)
 
+            weight_matrix.value = weight_matrix.value + tf.math.sign(weight_matrix.value) * weight_bias
             activation = weight_matrix.__matmul__(activation)
 
             if i < sequence_length:
@@ -402,13 +416,14 @@ dim_input = 784
 dim_output = 10
 if test is None:
     test = Network(dim_input, dim_output, [
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 0, 400),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 0, 1000),
     ])
 
 if best_choice_only_mode:

@@ -17,6 +17,8 @@ import tensorflow_addons as tfa
 
 from sparse_row_matrix import SparseRowMatrix
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 random.seed(0)
 tf.random.set_seed(0)
 
@@ -27,7 +29,7 @@ weight_decay_weights = 0.0003
 
 learning_rate_topo = 0.0003
 
-conn_param_bias = 0.001
+conn_param_bias = 0.0001
 decay_limit = 1 / 99999999
 min_conn_param = 0.0 + conn_param_bias
 max_conn_param = 1.0 - conn_param_bias
@@ -44,16 +46,16 @@ top_vis_intervall = 500
 topology_batch_size = 1
 
 # this means the loaded weights will be reset at the start and only most prob choice will be picked.
-best_choice_only_mode = False
+best_choice_only_mode = True
 
-version_name = "sparse_a_estimator_test_sequential"
+version_name = "sparse_st_test_sequential"
 
 work_dir = "."
 # work_dir = os.environ["WORK"]
 
 
 # For debug purpose
-use_xor_set = False
+use_xor_set = True
 
 
 @tf.custom_gradient
@@ -102,7 +104,10 @@ def check(weight_matrix, connection_mask_matrix, activation):
         a_grad = tf.matmul(tf.transpose(weight_matrix * connection_mask_matrix), upstream)
         normal_wm_grad = tf.matmul(upstream, tf.transpose(activation))
         w_grad = normal_wm_grad * connection_mask_matrix
-        st_wm_grad = tf.matmul(upstream, tf.transpose(tf.ones(shape=activation.shape)))
+
+        st_wm_grad = tf.reduce_sum(upstream, axis=-1, keepdims=True)
+        st_wm_grad = tf.tile(st_wm_grad, [1, activation.shape[0]])
+
         cm_grad = st_wm_grad * weight_matrix
         return w_grad, cm_grad, a_grad
 
@@ -194,12 +199,12 @@ class Layer:
             tf.clip_by_value(self.connection_parameter.value, min_conn_param, max_conn_param)
         )
 
-        self.connection_parameter, connection_parameter_masked = mul_by_alive_vector(self.connection_parameter,
+        _, connection_parameter_masked = mul_by_alive_vector(self.connection_parameter,
                                                                                      output_nodes_alive)
 
         connection_mask_matrix, _ = binary_gate_sigmoid(connection_parameter_masked)
 
-        self.weight_matrix, weight_matrix_masked = mul_by_alive_vector(self.weight_matrix,
+        _, weight_matrix_masked = mul_by_alive_vector(self.weight_matrix,
                                                                        output_nodes_alive)
 
         weight_matrix = weight_matrix_masked
@@ -207,7 +212,7 @@ class Layer:
         self.activation_parameter.value.assign(
             tf.clip_by_value(self.activation_parameter.value, min_conn_param, max_conn_param)
         )
-        self.activation_parameter, activation_parameter_masked = mul_by_alive_vector(self.activation_parameter,
+        _, activation_parameter_masked = mul_by_alive_vector(self.activation_parameter,
                                                                                      output_nodes_alive)
         activation_mask, _ = binary_gate_sigmoid(activation_parameter_masked)
 
@@ -349,21 +354,17 @@ class Network:
 
         first_hidden_layer_weights = sequence[-1][0]
         input = tf.transpose(input_batch)
-        activation = tf.constant(0.0,
-                                 shape=(first_hidden_layer_weights.dense_shape[1] - num_input_nodes, input.shape[1]))
+        activation = SparseRowMatrix(
+            dense_shape=[first_hidden_layer_weights.dense_shape[1] - num_input_nodes, input.shape[1]])
 
         i = 1
         for weight_matrix, connection_mask_matrix, activation_mask, input_nodes_alive in reversed(
                 sequence):
 
-            activation = tf.concat([activation, input], axis=0)
+            activation = activation.concat_dense(input)
 
             weight_matrix.value = weight_matrix.value + tf.math.sign(weight_matrix.value) * weight_bias
-            r_value = check(weight_matrix.value, connection_mask_matrix.value, activation)
-            r = SparseRowMatrix(dense_shape=[weight_matrix.dense_shape[0], activation.shape[-1]])
-            r.value = r_value
-            r.indices = list.copy(weight_matrix.indices)
-            activation = r
+            activation = special_sparse_matmul(weight_matrix, connection_mask_matrix.value, activation)
 
             if i < sequence_length:
                 activation = apply_activation(activation, activation_mask)
@@ -376,7 +377,7 @@ class Network:
 
             i += 1
 
-            activation = activation.to_dense(0.0, tf.float32)
+        activation = activation.to_dense(0.0, tf.float32)
 
         return tf.transpose(activation)
 
@@ -397,9 +398,36 @@ class Network:
             tf.print("Load Error")
             return None
 
+
+def special_sparse_matmul(weight_matrix, connection_mask, activation):
+    a = weight_matrix
+    b = activation
+    assert a.dense_shape[1] == b.dense_shape[0]
+    if a.value.shape[0] == 0 or b.value.shape[0] == 0:
+        r_value = tf.zeros(shape=(a.value.shape[0], b.dense_shape[-1]))
+        r_indices = a.indices
+        r = SparseRowMatrix(dense_shape=[a.dense_shape[0], b.dense_shape[-1]])
+        r.indices = r_indices
+        r.value = r_value
+        return r
+
+    A = a.value
+    B = b.value
+    mask_A = b.indices
+    masked_A = tf.boolean_mask(A, mask_A, axis=1)
+    masked_C = tf.boolean_mask(connection_mask, mask_A, axis=1)
+    r_value = check(masked_A, masked_C, B)
+    r_indices = a.indices
+    r = SparseRowMatrix(dense_shape=[a.dense_shape[0], b.dense_shape[-1]])
+    r.indices = r_indices
+    r.value = r_value
+    return r
+
+
 def categorical_loss(y_true, y_pred):
     probs = tf.math.softmax(y_pred, axis=-1)
     return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true, probs))
+
 
 def mean_squared_loss(y_true, y_pred):
     return tf.keras.losses.mean_squared_error(y_true, y_pred)
@@ -415,13 +443,14 @@ dim_input = 784
 dim_output = 10
 if test is None:
     test = Network(dim_input, dim_output, [
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 400, 400),
-        Layer(dim_input, 0, 400),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 1000, 1000),
+        Layer(dim_input, 0, 1000),
     ])
 
 if best_choice_only_mode:
@@ -512,7 +541,6 @@ for i in range(batches_test):
 
 """ Load the DataSet End """
 
-
 if use_xor_set:
     # Now we overwrite all the normal init sets and the network (my need to remove existing checkpoints)
     test_input = tf.constant([
@@ -565,6 +593,7 @@ def clip_grads_by_global_norm(grads, norm: float):
         grads[grad_index] = tf.cast(grads[grad_index], dtype=type)
 
     return grads
+
 
 def apply_batch(batch, loss_function: Callable, train_weight: bool, train_topology: bool):
     batch_x, batch_y = batch

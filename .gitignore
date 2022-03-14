@@ -1,4 +1,5 @@
 .idea/
 logs/
+log_backups/
 checkpoints/
 __pycache__/
